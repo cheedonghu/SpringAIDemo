@@ -17,6 +17,7 @@ import reactor.core.publisher.Flux;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * ollama测试
@@ -56,8 +57,8 @@ public class OllamaController {
         return Map.of("embedding", embeddingResponse);
     }
 
-    @GetMapping("/ai/embedding/query")
-    public Map query(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
+    @GetMapping("/ai/embedding/add")
+    public String add(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
         List<Document> documents = List.of(
                 new Document("Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!!", Map.of("meta1", "meta1")),
                 new Document("The World is Big and Salvation Lurks Around the Corner"),
@@ -65,9 +66,17 @@ public class OllamaController {
 
         // Add the documents
         vectorStore.add(documents);
+        return "ok";
+    }
+
+    @GetMapping("/ai/embedding/query")
+    public Map query(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
 
         // Retrieve documents similar to a query
         List<Document> results = vectorStore.similaritySearch(SearchRequest.query("Spring").withTopK(5));
-        return Map.of("result", results);
+
+        Optional<String> reduce = results.stream().map(Document::getContent).reduce(String::concat);
+
+        return Map.of("result", reduce.orElse("查询无结果"));
     }
 }
