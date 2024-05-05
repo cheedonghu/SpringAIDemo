@@ -7,8 +7,9 @@ import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingClient;
 import org.springframework.ai.embedding.EmbeddingResponse;
 import org.springframework.ai.ollama.OllamaChatClient;
+import org.springframework.ai.vectorstore.Neo4jVectorStore;
+import org.springframework.ai.vectorstore.PineconeVectorStore;
 import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -31,13 +32,18 @@ import java.util.Optional;
 public class OllamaController {
     private final OllamaChatClient ollamaChatClient;
     private final EmbeddingClient embeddingClient;
-    private final VectorStore vectorStore;
+    private final PineconeVectorStore pineconeVectorStore;
+    private final Neo4jVectorStore neo4jVectorStore;
 
     @Autowired
-    public OllamaController(OllamaChatClient ollamaChatClient, EmbeddingClient embeddingClient, VectorStore vectorStore) {
+    public OllamaController(OllamaChatClient ollamaChatClient,
+                            EmbeddingClient embeddingClient,
+                            PineconeVectorStore pineconeVectorStore,
+                            Neo4jVectorStore neo4jVectorStore) {
         this.ollamaChatClient = ollamaChatClient;
         this.embeddingClient = embeddingClient;
-        this.vectorStore = vectorStore;
+        this.pineconeVectorStore = pineconeVectorStore;
+        this.neo4jVectorStore = neo4jVectorStore;
     }
 
     @GetMapping("/ai/generate")
@@ -57,23 +63,48 @@ public class OllamaController {
         return Map.of("embedding", embeddingResponse);
     }
 
-    @GetMapping("/ai/embedding/add")
-    public String add(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
+    @GetMapping("/ai/embedding/pinecone/add")
+    public String pineconeAdd(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
         List<Document> documents = List.of(
                 new Document("Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!!", Map.of("meta1", "meta1")),
                 new Document("The World is Big and Salvation Lurks Around the Corner"),
                 new Document("You walk forward facing the past and you turn back toward the future.", Map.of("meta2", "meta2")));
 
         // Add the documents
-        vectorStore.add(documents);
+        pineconeVectorStore.add(documents);
         return "ok";
     }
 
-    @GetMapping("/ai/embedding/query")
-    public Map query(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
+    @GetMapping("/ai/embedding/neo4j/add")
+    public String neo4jAdd(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
+        List<Document> documents = List.of(
+                new Document("Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!!", Map.of("meta1", "meta1")),
+                new Document("The World is Big and Salvation Lurks Around the Corner"),
+                new Document("You walk forward facing the past and you turn back toward the future.", Map.of("meta2", "meta2")));
+
+        // Add the documents
+        neo4jVectorStore.add(documents);
+        return "ok";
+    }
+
+    @GetMapping("/ai/embedding/pinecone/query")
+    public Map pineconeQuery(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
 
         // Retrieve documents similar to a query
-        List<Document> results = vectorStore.similaritySearch(SearchRequest.query("Spring").withTopK(5));
+        List<Document> results = pineconeVectorStore.similaritySearch(SearchRequest.query("Spring")
+                .withTopK(5).withSimilarityThreshold(0.3));
+
+        Optional<String> reduce = results.stream().map(Document::getContent).reduce(String::concat);
+
+        return Map.of("result", reduce.orElse("查询无结果"));
+    }
+
+    @GetMapping("/ai/embedding/neo4j/query")
+    public Map neo4jQuery(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
+
+        // Retrieve documents similar to a query
+        List<Document> results = neo4jVectorStore.similaritySearch(SearchRequest.query("Spring")
+                .withTopK(5).withSimilarityThreshold(0.3));
 
         Optional<String> reduce = results.stream().map(Document::getContent).reduce(String::concat);
 

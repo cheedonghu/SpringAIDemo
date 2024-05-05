@@ -2,7 +2,6 @@ package com.luyublog.aidemo.vecstore.pinecone;
 
 import org.springframework.ai.embedding.EmbeddingClient;
 import org.springframework.ai.vectorstore.PineconeVectorStore;
-import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -44,7 +43,7 @@ public class PineconeVectorStoreConf {
     }
 
     @Bean
-    public VectorStore vectorStore(PineconeVectorStore.PineconeVectorStoreConfig config, EmbeddingClient ollamaEmbeddingClient) {
+    public PineconeVectorStore vectorStore(PineconeVectorStore.PineconeVectorStoreConfig config, EmbeddingClient ollamaEmbeddingClient) {
         return new PineconeVectorStore(config, ollamaEmbeddingClient);
     }
 }
