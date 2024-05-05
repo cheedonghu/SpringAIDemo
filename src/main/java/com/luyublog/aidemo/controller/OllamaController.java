@@ -66,9 +66,9 @@ public class OllamaController {
     @GetMapping("/ai/embedding/pinecone/add")
     public String pineconeAdd(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
         List<Document> documents = List.of(
-                new Document("Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!!", Map.of("meta1", "meta1")),
+                new Document("Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!! Spring AI rocks!!", Map.of("author", "john")),
                 new Document("The World is Big and Salvation Lurks Around the Corner"),
-                new Document("You walk forward facing the past and you turn back toward the future.", Map.of("meta2", "meta2")));
+                new Document("You walk forward facing the past and you turn back toward the future.", Map.of("author", "jill")));
 
         // Add the documents
         pineconeVectorStore.add(documents);
@@ -109,5 +109,23 @@ public class OllamaController {
         Optional<String> reduce = results.stream().map(Document::getContent).reduce(String::concat);
 
         return Map.of("result", reduce.orElse("查询无结果"));
+    }
+
+    @GetMapping("/ai/embedding/neo4j/query2")
+    public Map neo4jQuery2(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
+
+        // Retrieve documents similar to a query
+        List<Document> results = neo4jVectorStore.similaritySearch(
+                SearchRequest.defaults()
+                        .withQuery("The World")
+//                        .withTopK(5)
+//                        .withSimilarityThreshold(0.3)
+                        .withFilterExpression("author in ['john', 'jill'] || 'article_type' == 'blog'"));
+
+        Optional<String> reduce = results.stream().map(Document::getContent).reduce(String::concat);
+
+        return Map.of("result", reduce.orElse("查询无结果"));
+
+
     }
 }

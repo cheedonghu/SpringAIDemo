@@ -10,6 +10,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
+import java.lang.reflect.Field;
+
 /**
  * neo4j配置
  * <p>
@@ -39,6 +41,9 @@ public class MyNeo4jVectorStoreConf {
     @Value(value = "${spring.ai.vectorstore.neo4j.label}")
     String label;
 
+    @Value(value = "${spring.ai.vectorstore.neo4j.index-name}")
+    String indexName;
+
     @Autowired
     OllamaEmbeddingClient ollamaEmbeddingClient;
 
@@ -48,7 +53,24 @@ public class MyNeo4jVectorStoreConf {
 
     @Bean
     public Neo4jVectorStore neo4jVectorStore() {
-        Neo4jVectorStore.Neo4jVectorStoreConfig neo4jVectorStoreConfig = Neo4jVectorStore.Neo4jVectorStoreConfig.builder().withEmbeddingDimension(dimension).withLabel(label).build();
+        Neo4jVectorStore.Neo4jVectorStoreConfig neo4jVectorStoreConfig = Neo4jVectorStore.
+                Neo4jVectorStoreConfig.builder().
+//                withEmbeddingDimension(dimension).
+        withIndexName(indexName).
+                withLabel(label).build();
+
+        // dimension被限制小于2048，这里用反射跳过限制
+        try {
+            Class<? extends Neo4jVectorStore.Neo4jVectorStoreConfig> aClass = neo4jVectorStoreConfig.getClass();
+            Field embeddingDimension = aClass.getDeclaredField("embeddingDimension");
+            embeddingDimension.setAccessible(true);
+            embeddingDimension.setInt(neo4jVectorStoreConfig, dimension);
+        } catch (NoSuchFieldException e) {
+            throw new RuntimeException(e);
+        } catch (IllegalAccessException e) {
+            throw new RuntimeException(e);
+        }
+
         return new Neo4jVectorStore(driver(), ollamaEmbeddingClient, neo4jVectorStoreConfig);
     }
 
