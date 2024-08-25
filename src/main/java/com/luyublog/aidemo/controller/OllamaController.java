@@ -91,6 +91,7 @@ public class OllamaController {
     public Map pineconeQuery(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
 
         // Retrieve documents similar to a query
+        // 版本换到1.0.0后，score从-400,-1000到了30,60 可以正常查询了
         List<Document> results = pineconeVectorStore.similaritySearch(SearchRequest.query("Spring")
                 .withTopK(5).withSimilarityThreshold(0.3));
 
