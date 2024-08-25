@@ -1,7 +1,8 @@
 package com.luyublog.aidemo.embed;
 
-import org.springframework.ai.ollama.OllamaEmbeddingClient;
+import org.springframework.ai.ollama.OllamaEmbeddingModel;
 import org.springframework.ai.ollama.api.OllamaApi;
+import org.springframework.ai.ollama.api.OllamaModel;
 import org.springframework.ai.ollama.api.OllamaOptions;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -21,11 +22,12 @@ public class OllamaEmbeddingConf {
     String model;
 
     @Bean
-    public OllamaEmbeddingClient ollamaEmbeddingClient() {
+    public OllamaEmbeddingModel ollamaEmbeddingModel() {
         var ollamaApi = new OllamaApi();
 
-        return new OllamaEmbeddingClient(ollamaApi)
-                .withDefaultOptions(OllamaOptions.create()
-                        .withModel(model));
+        return new OllamaEmbeddingModel(ollamaApi,
+                OllamaOptions.builder()
+                        .withModel(OllamaModel.LLAMA3_1.id())
+                        .build());
     }
 }

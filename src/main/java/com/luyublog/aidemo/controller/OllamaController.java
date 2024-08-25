@@ -1,12 +1,12 @@
 package com.luyublog.aidemo.controller;
 
-import org.springframework.ai.chat.ChatResponse;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.embedding.EmbeddingClient;
 import org.springframework.ai.embedding.EmbeddingResponse;
-import org.springframework.ai.ollama.OllamaChatClient;
+import org.springframework.ai.ollama.OllamaChatModel;
+import org.springframework.ai.ollama.OllamaEmbeddingModel;
 import org.springframework.ai.vectorstore.Neo4jVectorStore;
 import org.springframework.ai.vectorstore.PineconeVectorStore;
 import org.springframework.ai.vectorstore.SearchRequest;
@@ -30,36 +30,36 @@ import java.util.Optional;
  */
 @RestController
 public class OllamaController {
-    private final OllamaChatClient ollamaChatClient;
-    private final EmbeddingClient embeddingClient;
+    private final OllamaChatModel ollamaChatModel;
+    private final OllamaEmbeddingModel ollamaEmbeddingModel;
     private final PineconeVectorStore pineconeVectorStore;
     private final Neo4jVectorStore neo4jVectorStore;
 
     @Autowired
-    public OllamaController(OllamaChatClient ollamaChatClient,
-                            EmbeddingClient embeddingClient,
+    public OllamaController(OllamaChatModel ollamaChatModel,
+                            OllamaEmbeddingModel ollamaEmbeddingModel,
                             PineconeVectorStore pineconeVectorStore,
                             Neo4jVectorStore neo4jVectorStore) {
-        this.ollamaChatClient = ollamaChatClient;
-        this.embeddingClient = embeddingClient;
+        this.ollamaChatModel = ollamaChatModel;
+        this.ollamaEmbeddingModel = ollamaEmbeddingModel;
         this.pineconeVectorStore = pineconeVectorStore;
         this.neo4jVectorStore = neo4jVectorStore;
     }
 
     @GetMapping("/ai/generate")
     public Map generate(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
-        return Map.of("generation", ollamaChatClient.call(message));
+        return Map.of("generation", ollamaChatModel.call(message));
     }
 
     @GetMapping("/ai/generateStream")
     public Flux<ChatResponse> generateStream(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
         Prompt prompt = new Prompt(new UserMessage(message));
-        return ollamaChatClient.stream(prompt);
+        return ollamaChatModel.stream(prompt);
     }
 
     @GetMapping("/ai/embedding")
     public Map embed(@RequestParam(value = "message", defaultValue = "Tell me a joke") String message) {
-        EmbeddingResponse embeddingResponse = this.embeddingClient.embedForResponse(List.of(message));
+        EmbeddingResponse embeddingResponse = this.ollamaEmbeddingModel.embedForResponse(List.of(message));
         return Map.of("embedding", embeddingResponse);
     }
 

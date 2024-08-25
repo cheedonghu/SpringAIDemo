@@ -3,7 +3,7 @@ package com.luyublog.aidemo.vecstore.neo4j;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.GraphDatabase;
-import org.springframework.ai.ollama.OllamaEmbeddingClient;
+import org.springframework.ai.ollama.OllamaEmbeddingModel;
 import org.springframework.ai.vectorstore.Neo4jVectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -45,7 +45,7 @@ public class MyNeo4jVectorStoreConf {
     String indexName;
 
     @Autowired
-    OllamaEmbeddingClient ollamaEmbeddingClient;
+    OllamaEmbeddingModel ollamaEmbeddingModel;
 
     public Driver driver() {
         return GraphDatabase.driver(uri, AuthTokens.basic(username, password));
@@ -71,7 +71,7 @@ public class MyNeo4jVectorStoreConf {
             throw new RuntimeException(e);
         }
 
-        return new Neo4jVectorStore(driver(), ollamaEmbeddingClient, neo4jVectorStoreConfig);
+        return new Neo4jVectorStore(driver(), ollamaEmbeddingModel, neo4jVectorStoreConfig, false);
     }
 
 }
