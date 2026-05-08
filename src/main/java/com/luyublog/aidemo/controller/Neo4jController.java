@@ -1,11 +1,15 @@
 package com.luyublog.aidemo.controller;
 
+import com.luyublog.aidemo.ingest.FileIngestService;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.neo4j.Neo4jVectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.Map;
@@ -23,12 +27,15 @@ public class Neo4jController {
 
     private final Neo4jVectorStore neo4jVectorStore;
     private final Neo4jHybridSearchService hybridSearchService;
+    private final FileIngestService fileIngestService;
 
     @Autowired
     public Neo4jController(Neo4jVectorStore neo4jVectorStore,
-                           Neo4jHybridSearchService hybridSearchService) {
+                           Neo4jHybridSearchService hybridSearchService,
+                           FileIngestService fileIngestService) {
         this.neo4jVectorStore = neo4jVectorStore;
         this.hybridSearchService = hybridSearchService;
+        this.fileIngestService = fileIngestService;
     }
 
     @GetMapping("/ai/neo4j/add")
@@ -61,6 +68,23 @@ public class Neo4jController {
                 "result", searchResult.result(),
                 "documents", searchResult.documents(),
                 "debug", searchResult.debug()
+        );
+    }
+
+    @PostMapping(value = "/ai/neo4j/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public Map<String, Object> upload(@RequestParam("file") MultipartFile file) {
+        List<Document> documents = this.fileIngestService.ingest(file);
+        this.neo4jVectorStore.add(documents);
+
+        List<Object> sampleHeadings = documents.stream()
+                .limit(5)
+                .map(doc -> doc.getMetadata().getOrDefault("heading", ""))
+                .toList();
+
+        return Map.of(
+                "filename", file.getOriginalFilename(),
+                "chunkCount", documents.size(),
+                "sampleHeadings", sampleHeadings
         );
     }
 }
