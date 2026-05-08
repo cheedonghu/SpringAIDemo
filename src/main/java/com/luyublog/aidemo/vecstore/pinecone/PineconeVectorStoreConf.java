@@ -1,9 +1,9 @@
 package com.luyublog.aidemo.vecstore.pinecone;
 
-import org.springframework.ai.ollama.OllamaEmbeddingModel;
-import org.springframework.ai.vectorstore.PineconeVectorStore;
+//import org.springframework.ai.ollama.OllamaEmbeddingModel;
+//import org.springframework.ai.vectorstore.PineconeVectorStore;
+
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
@@ -28,22 +28,22 @@ public class PineconeVectorStoreConf {
     @Value(value = "${spring.ai.vectorstore.pinecone.index-name}")
     String indexName;
 
-    @Bean
-    public PineconeVectorStore.PineconeVectorStoreConfig pineconeVectorStoreConfig() {
-
-        return PineconeVectorStore.PineconeVectorStoreConfig.builder()
-                .withApiKey(apikey)
-                .withEnvironment(environment)
-//                .withProjectId("89309e6")
-//                .withIndexName("spring-ai-test-index")
-                .withProjectId(projectId)
-                .withIndexName(indexName)
-                .withNamespace("") // the free tier doesn't support namespaces.
-                .build();
-    }
-
-    @Bean
-    public PineconeVectorStore vectorStore(PineconeVectorStore.PineconeVectorStoreConfig config, OllamaEmbeddingModel ollamaEmbeddingModel) {
-        return new PineconeVectorStore(config, ollamaEmbeddingModel);
-    }
+//    @Bean
+//    public PineconeVectorStore.PineconeVectorStoreConfig pineconeVectorStoreConfig() {
+//
+//        return PineconeVectorStore.PineconeVectorStoreConfig.builder()
+//                .withApiKey(apikey)
+//                .withEnvironment(environment)
+////                .withProjectId("89309e6")
+////                .withIndexName("spring-ai-test-index")
+//                .withProjectId(projectId)
+//                .withIndexName(indexName)
+//                .withNamespace("") // the free tier doesn't support namespaces.
+//                .build();
+//    }
+//
+//    @Bean
+//    public PineconeVectorStore vectorStore(PineconeVectorStore.PineconeVectorStoreConfig config, OllamaEmbeddingModel ollamaEmbeddingModel) {
+//        return new PineconeVectorStore(config, ollamaEmbeddingModel);
+//    }
 }
