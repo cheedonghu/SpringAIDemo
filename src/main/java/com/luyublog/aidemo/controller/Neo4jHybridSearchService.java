@@ -14,12 +14,14 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Neo4j 混合召回：关键词检索 + 语义检索 + MMR 去重重排
+ * Neo4j 混合召回：关键词检索 + 语义检索 + RRF 融合 + MMR 去重重排
  *
  * 整体流程：
  *   1) 语义检索：基于向量索引（db.index.vector.queryNodes）按余弦相似度召回候选；
  *   2) 关键词检索：基于全文索引（db.index.fulltext.queryNodes）按 BM25 召回候选，并按词面重叠/命中数过滤；
- *   3) 合并打分：对两路候选按 id 合并，融合语义分与关键词分得到 blendedScore；
+ *   3) RRF 融合：对两路候选按 id 合并，按各通道的 rank 做倒数排名融合
+ *      rrfScore(d) = Σ 1 / (k + rank_i(d))
+ *      不依赖原始分值的量纲，绕开 BM25 与余弦的归一化玄学；
  *   4) MMR 重排：在相关度与多样性之间做权衡，避免返回内容高度相似的结果。
  */
 @Service
@@ -39,7 +41,7 @@ public class Neo4jHybridSearchService {
     private final String keywordIndexName;      // 全文索引名（关键词检索用）
     private final String label;
     private final String embeddingProperty;     // 节点上存放向量的属性名
-    private final double keywordWeight;         // 关键词得分在 blendedScore 中的权重
+    private final int rrfK;                     // RRF 折扣常数，越大头部 rank 间差距越被抹平（业界默认 60）
     private final double minLexicalOverlap;     // 关键词候选最小词面重叠率，过滤纯 BM25 噪声
     private final int minKeywordHits;           // 关键词候选最小命中词数，过滤纯 BM25 噪声
 
@@ -50,7 +52,7 @@ public class Neo4jHybridSearchService {
                                     @Value("${spring.ai.vectorstore.neo4j.keyword-index-name:aidemo-neo4j-keyword-index}") String keywordIndexName,
                                     @Value("${spring.ai.vectorstore.neo4j.label:Document}") String label,
                                     @Value("${spring.ai.vectorstore.neo4j.embedding-property:embedding}") String embeddingProperty,
-                                    @Value("${app.hybrid.keyword-weight:0.15}") double keywordWeight,
+                                    @Value("${app.hybrid.rrf-k:60}") int rrfK,
                                     @Value("${app.hybrid.min-lexical-overlap:0.2}") double minLexicalOverlap,
                                     @Value("${app.hybrid.min-keyword-hits:1}") int minKeywordHits) {
         this.driver = driver;
@@ -60,7 +62,7 @@ public class Neo4jHybridSearchService {
         this.keywordIndexName = keywordIndexName;
         this.label = label;
         this.embeddingProperty = embeddingProperty;
-        this.keywordWeight = keywordWeight;
+        this.rrfK = rrfK;
         this.minLexicalOverlap = minLexicalOverlap;
         this.minKeywordHits = minKeywordHits;
     }
@@ -183,27 +185,58 @@ public class Neo4jHybridSearchService {
                                                            List<CandidateDocument> semanticCandidates,
                                                            List<CandidateDocument> keywordCandidates,
                                                            float[] queryEmbedding) {
+        Map<String, Integer> semanticRanks = buildRankIndex(semanticCandidates);
+        Map<String, Integer> keywordRanks = buildRankIndex(keywordCandidates);
+
         Map<String, CandidateDocument> merged = new LinkedHashMap<>();
-        semanticCandidates.forEach(candidate -> mergeCandidate(merged, candidate, queryTerms, queryEmbedding));
-        keywordCandidates.forEach(candidate -> mergeCandidate(merged, candidate, queryTerms, queryEmbedding));
+        semanticCandidates.forEach(candidate -> mergeCandidate(merged, candidate, queryEmbedding, semanticRanks, keywordRanks));
+        keywordCandidates.forEach(candidate -> mergeCandidate(merged, candidate, queryEmbedding, semanticRanks, keywordRanks));
         return merged;
     }
 
     /**
-     * 将一条候选合入结果 Map。同一 id 的两路候选要做信号合并：
-     * - 语义分取两路最大值；如仍为 0（关键词通道带来的候选没有语义分），则补算余弦相似度；
-     * - 关键词分及词面信号取两路最大值；
-     * - 重新计算 blendedScore 以反映合并后的完整信号。
+     * 为已排序的候选列表建立 id → rank（1-indexed）映射，给 RRF 融合使用。
+     * 两路 cypher 都按 LIMIT 截断且 id 唯一，理论上同一 id 不会出现多次，putIfAbsent 仅作防御。
      */
-    private void mergeCandidate(Map<String, CandidateDocument> merged, CandidateDocument incoming, QueryTerms queryTerms, float[] queryEmbedding) {
+    private Map<String, Integer> buildRankIndex(List<CandidateDocument> candidates) {
+        Map<String, Integer> ranks = new LinkedHashMap<>();
+        for (int i = 0; i < candidates.size(); i++) {
+            String id = candidates.get(i).document().getId();
+            if (id != null) {
+                ranks.putIfAbsent(id, i + 1);
+            }
+        }
+        return ranks;
+    }
+
+    /**
+     * 将一条候选合入结果 Map。同一 id 的两路候选要做信号合并：
+     * - 语义分取两路最大值；如仍为 0（关键词通道带来的候选没有语义分），则补算余弦相似度供后续 MMR 使用；
+     * - 关键词分及词面信号取两路最大值，仅作 debug 展示，不参与最终排序；
+     * - 最终排序信号 rrfScore = Σ 1 / (rrfK + rank_i)，rank 来自 buildRankIndex 的结果。
+     */
+    private void mergeCandidate(Map<String, CandidateDocument> merged,
+                                CandidateDocument incoming,
+                                float[] queryEmbedding,
+                                Map<String, Integer> semanticRanks,
+                                Map<String, Integer> keywordRanks) {
         String candidateId = incoming.document().getId();
+        if (candidateId == null) {
+            return;
+        }
+        Integer semanticRank = semanticRanks.get(candidateId);
+        Integer keywordRank = keywordRanks.get(candidateId);
+        double rrfScore = computeRrf(semanticRank, keywordRank);
+
         CandidateDocument existing = merged.get(candidateId);
         if (existing == null) {
-            // 首次入池：若来自关键词通道则补算余弦相似度，保证语义分始终可用
-            double normalizedSemanticScore = incoming.semanticScore() > 0 ? incoming.semanticScore() : cosineSimilarity(queryEmbedding, incoming.embedding());
-            double normalizedKeywordScore = lexicalScore(queryTerms, incoming, incoming.keywordScore());
-            double blendedScore = blendedScore(normalizedSemanticScore, normalizedKeywordScore, incoming.containsExactPhrase());
-            merged.put(candidateId, incoming.withScores(normalizedSemanticScore, normalizedKeywordScore, blendedScore));
+            // 首次入池：若来自关键词通道则补算余弦相似度，保证语义分对后续 MMR 可用
+            double normalizedSemanticScore = incoming.semanticScore() > 0
+                    ? incoming.semanticScore()
+                    : cosineSimilarity(queryEmbedding, incoming.embedding());
+            merged.put(candidateId, incoming
+                    .withRanks(semanticRank, keywordRank)
+                    .withScores(normalizedSemanticScore, incoming.keywordScore(), rrfScore));
             return;
         }
 
@@ -212,14 +245,25 @@ public class Neo4jHybridSearchService {
         if (semanticScore <= 0) {
             semanticScore = cosineSimilarity(queryEmbedding, existing.embedding());
         }
-
         double keywordScore = Math.max(existing.keywordScore(), incoming.keywordScore());
         double lexicalOverlap = Math.max(existing.lexicalOverlap(), incoming.lexicalOverlap());
         int keywordHits = Math.max(existing.keywordHits(), incoming.keywordHits());
         boolean containsExactPhrase = existing.containsExactPhrase() || incoming.containsExactPhrase();
-        CandidateDocument mergedCandidate = existing.mergeKeywordSignals(keywordScore, lexicalOverlap, keywordHits, containsExactPhrase);
-        double normalizedKeywordScore = lexicalScore(queryTerms, mergedCandidate, keywordScore);
-        merged.put(candidateId, mergedCandidate.withScores(semanticScore, normalizedKeywordScore, blendedScore(semanticScore, normalizedKeywordScore, containsExactPhrase)));
+        merged.put(candidateId, existing
+                .mergeKeywordSignals(keywordScore, lexicalOverlap, keywordHits, containsExactPhrase)
+                .withRanks(semanticRank, keywordRank)
+                .withScores(semanticScore, keywordScore, rrfScore));
+    }
+
+    private double computeRrf(Integer semanticRank, Integer keywordRank) {
+        double score = 0.0;
+        if (semanticRank != null) {
+            score += 1.0 / (this.rrfK + semanticRank);
+        }
+        if (keywordRank != null) {
+            score += 1.0 / (this.rrfK + keywordRank);
+        }
+        return score;
     }
 
     /**
@@ -229,11 +273,16 @@ public class Neo4jHybridSearchService {
      * 目的是避免 topK 全是几乎相同表述的"近重复"文档。
      */
     private List<CandidateDocument> mmrSelect(Collection<CandidateDocument> candidates, float[] queryEmbedding, int topK, double mmrLambda) {
-        // 仅保留有 embedding 的候选（无向量则无法计算多样性惩罚），并按 blendedScore 预排序
+        // 仅保留有 embedding 的候选（无向量则无法计算多样性惩罚），并按 rrfScore 预排序
         List<CandidateDocument> remaining = candidates.stream()
                 .filter(candidate -> candidate.embedding() != null && candidate.embedding().length > 0)
-                .sorted(Comparator.comparingDouble(CandidateDocument::blendedScore).reversed())
+                .sorted(Comparator.comparingDouble(CandidateDocument::rrfScore).reversed())
                 .collect(Collectors.toCollection(ArrayList::new));
+
+        // RRF 原始分值很小（理论上限 2/(rrfK+1) ≈ 0.033），与余弦相似度的多样性惩罚 [0,1] 量纲悬殊，
+        // 故在本批内归一到 [0,1]，让 λ 的物理意义恢复直观
+        double maxRrf = remaining.stream().mapToDouble(CandidateDocument::rrfScore).max().orElse(0.0);
+        double rrfNorm = maxRrf > 0 ? maxRrf : 1.0;
 
         List<CandidateDocument> selected = new ArrayList<>();
         while (!remaining.isEmpty() && selected.size() < topK) {
@@ -241,9 +290,9 @@ public class Neo4jHybridSearchService {
             double bestScore = Double.NEGATIVE_INFINITY;
 
             for (CandidateDocument candidate : remaining) {
-                // 相关度：优先用融合后的 blendedScore，缺失时退化为与 query 的余弦相似度
-                double relevance = candidate.blendedScore() > 0
-                        ? candidate.blendedScore()
+                // 相关度：优先用归一化后的 rrfScore，缺失时退化为与 query 的余弦相似度
+                double relevance = candidate.rrfScore() > 0
+                        ? candidate.rrfScore() / rrfNorm
                         : cosineSimilarity(queryEmbedding, candidate.embedding());
                 // 多样性惩罚：与已选结果中最相似那一篇的相似度，越大越"重复"
                 double diversityPenalty = selected.stream()
@@ -289,11 +338,13 @@ public class Neo4jHybridSearchService {
         payload.put("text", candidate.document().getText());
         payload.put("metadata", candidate.document().getMetadata());
         payload.put("semanticScore", candidate.semanticScore());
+        payload.put("semanticRank", candidate.semanticRank());
         payload.put("keywordScore", candidate.keywordScore());
+        payload.put("keywordRank", candidate.keywordRank());
         payload.put("lexicalOverlap", candidate.lexicalOverlap());
         payload.put("keywordHits", candidate.keywordHits());
         payload.put("containsExactPhrase", candidate.containsExactPhrase());
-        payload.put("blendedScore", candidate.blendedScore());
+        payload.put("rrfScore", candidate.rrfScore());
         payload.put("mmrScore", candidate.mmrScore());
         return payload;
     }
@@ -307,8 +358,7 @@ public class Neo4jHybridSearchService {
         Document document = new Document(id, text, metadata);
         double semanticScore = scoreSource == ScoreSource.SEMANTIC ? record.get("semanticScore").asDouble() : 0.0;
         double keywordScore = scoreSource == ScoreSource.KEYWORD ? record.get("keywordScore").asDouble() : 0.0;
-        double blendedScore = blendedScore(semanticScore, keywordScore, false);
-        return new CandidateDocument(document, embedding, semanticScore, keywordScore, 0.0, 0, false, blendedScore, 0.0);
+        return new CandidateDocument(document, embedding, semanticScore, keywordScore, 0.0, 0, false, null, null, 0.0, 0.0);
     }
 
     /**
@@ -332,40 +382,12 @@ public class Neo4jHybridSearchService {
                 .collect(Collectors.joining(" OR "));
     }
 
-    /**
-     * 融合公式：
-     *   blended = semantic * (1 - w) + normalize(keyword) * w + 命中完整短语的奖励
-     * 关键词分先做 x/(1+x) 归一化，把 BM25 不定上界压到 [0, 1)，使其与余弦相似度量纲可比。
-     */
-    private double blendedScore(double semanticScore, double keywordScore, boolean containsExactPhrase) {
-        double exactPhraseBoost = containsExactPhrase ? 0.05 : 0.0;
-        return semanticScore * (1 - this.keywordWeight) + normalizeKeywordScore(keywordScore) * this.keywordWeight + exactPhraseBoost;
-    }
-
-    /** BM25 分数没有上界，这里用 x/(1+x) 压到 [0,1)，便于与语义分加权融合。 */
-    private double normalizeKeywordScore(double keywordScore) {
-        return keywordScore <= 0 ? 0.0 : keywordScore / (1.0 + keywordScore);
-    }
-
     private CandidateDocument enrichKeywordCandidate(CandidateDocument candidate, QueryTerms queryTerms) {
         String normalizedText = normalizeText(candidate.document().getText());
         int keywordHits = countKeywordHits(queryTerms, normalizedText);
         double lexicalOverlap = lexicalOverlap(queryTerms, normalizedText);
         boolean containsExactPhrase = containsExactPhrase(queryTerms, normalizedText);
         return candidate.withLexicalSignals(lexicalOverlap, keywordHits, containsExactPhrase);
-    }
-
-    /**
-     * 计算"关键词维度"的综合得分（用于替代原始 BM25 进入 blendedScore）：
-     *   归一化 BM25(0.2) + 词面重叠率(0.5) + 命中词覆盖率(0.2) + 精确短语命中(0.1)
-     * 词面重叠权重最高，因为它对"是否真的命中查询里的词"判断最稳定。
-     */
-    private double lexicalScore(QueryTerms queryTerms, CandidateDocument candidate, double rawKeywordScore) {
-        double normalizedKeywordScore = normalizeKeywordScore(rawKeywordScore);
-        double overlapScore = candidate.lexicalOverlap();
-        double hitCoverage = queryTerms.termCount() == 0 ? 0.0 : (double) candidate.keywordHits() / queryTerms.termCount();
-        double exactMatchBoost = candidate.containsExactPhrase() ? 1.0 : 0.0;
-        return normalizedKeywordScore * 0.2 + overlapScore * 0.5 + hitCoverage * 0.2 + exactMatchBoost * 0.1;
     }
 
     private double lexicalOverlap(QueryTerms queryTerms, String normalizedText) {
@@ -527,23 +549,29 @@ public class Neo4jHybridSearchService {
                                      double lexicalOverlap,
                                      int keywordHits,
                                      boolean containsExactPhrase,
-                                     double blendedScore,
+                                     Integer semanticRank,
+                                     Integer keywordRank,
+                                     double rrfScore,
                                      double mmrScore) {
 
-        private CandidateDocument withScores(double semanticScore, double keywordScore, double blendedScore) {
-            return new CandidateDocument(this.document, this.embedding, semanticScore, keywordScore, this.lexicalOverlap, this.keywordHits, this.containsExactPhrase, blendedScore, this.mmrScore);
+        private CandidateDocument withScores(double semanticScore, double keywordScore, double rrfScore) {
+            return new CandidateDocument(this.document, this.embedding, semanticScore, keywordScore, this.lexicalOverlap, this.keywordHits, this.containsExactPhrase, this.semanticRank, this.keywordRank, rrfScore, this.mmrScore);
         }
 
         private CandidateDocument withLexicalSignals(double lexicalOverlap, int keywordHits, boolean containsExactPhrase) {
-            return new CandidateDocument(this.document, this.embedding, this.semanticScore, this.keywordScore, lexicalOverlap, keywordHits, containsExactPhrase, this.blendedScore, this.mmrScore);
+            return new CandidateDocument(this.document, this.embedding, this.semanticScore, this.keywordScore, lexicalOverlap, keywordHits, containsExactPhrase, this.semanticRank, this.keywordRank, this.rrfScore, this.mmrScore);
         }
 
         private CandidateDocument mergeKeywordSignals(double keywordScore, double lexicalOverlap, int keywordHits, boolean containsExactPhrase) {
-            return new CandidateDocument(this.document, this.embedding, this.semanticScore, keywordScore, lexicalOverlap, keywordHits, containsExactPhrase, this.blendedScore, this.mmrScore);
+            return new CandidateDocument(this.document, this.embedding, this.semanticScore, keywordScore, lexicalOverlap, keywordHits, containsExactPhrase, this.semanticRank, this.keywordRank, this.rrfScore, this.mmrScore);
+        }
+
+        private CandidateDocument withRanks(Integer semanticRank, Integer keywordRank) {
+            return new CandidateDocument(this.document, this.embedding, this.semanticScore, this.keywordScore, this.lexicalOverlap, this.keywordHits, this.containsExactPhrase, semanticRank, keywordRank, this.rrfScore, this.mmrScore);
         }
 
         private CandidateDocument withMmrScore(double mmrScore) {
-            return new CandidateDocument(this.document, this.embedding, this.semanticScore, this.keywordScore, this.lexicalOverlap, this.keywordHits, this.containsExactPhrase, this.blendedScore, mmrScore);
+            return new CandidateDocument(this.document, this.embedding, this.semanticScore, this.keywordScore, this.lexicalOverlap, this.keywordHits, this.containsExactPhrase, this.semanticRank, this.keywordRank, this.rrfScore, mmrScore);
         }
     }
 }
