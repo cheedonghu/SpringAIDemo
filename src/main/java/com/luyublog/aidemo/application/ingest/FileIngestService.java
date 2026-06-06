@@ -1,6 +1,8 @@
-package com.luyublog.aidemo.ingest;
+package com.luyublog.aidemo.application.ingest;
 
-import com.luyublog.aidemo.model.Chunk;
+import com.luyublog.aidemo.domain.document.Chunk;
+import com.luyublog.aidemo.infrastructure.chunker.MarkdownChunker;
+import com.luyublog.aidemo.infrastructure.chunker.PlainTextChunker;
 import org.springframework.ai.document.Document;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;

@@ -1,4 +1,4 @@
-package com.luyublog.aidemo.model;
+package com.luyublog.aidemo.domain.document;
 
 import java.util.Map;
 
