@@ -45,40 +45,48 @@ interfaces  ─►  application  ─►  domain  ◄─  infrastructure
 - **`interfaces.http`** — inbound adapters: REST controllers. They map HTTP → application service calls → HTTP response.
   No business logic.
 
-### Package map (15 files)
+### Package map
 
 ```
 com.luyublog.aidemo
-├── AidemoApplication                                       Spring Boot entrypoint
+├── AidemoApplication                                       Spring Boot entrypoint (@MapperScan persistence.mysql)
 │
 ├── domain
 │   ├── document.Chunk                                      pre-embedding chunk (text + metadata)
 │   ├── embedding.EmbedResult                               dense float[] + sparse Map<Long,Float>
-│   └── retrieval.{HybridPoint, RetrievedDoc}               write/read value objects
+│   ├── retrieval.{HybridPoint, RetrievedDoc}               write/read value objects
+│   └── conversation.{Conversation, Message, MessageStatus, StreamEvent}  chat value objects + neutral stream event (pure)
 │
 ├── application
-│   ├── ingest.FileIngestService                            upload → chunk → List<Document>  (currently unwired; see below)
-│   └── rag.{RagService, RagAnswer}                         embed query → retrieve → prompt → LLM
+│   ├── ingest.{FileIngestService, IngestResult}            upload → chunk → embed → upsert  (wired via POST /ai/qdrant/upload)
+│   ├── rag.{RagService, RagAnswer}                         embed query → retrieve → prompt → LLM
+│   └── chat.{ChatStreamService, ChatGenerationConfig, MessageNotFoundException}  resumable SSE orchestration (bg generate → Redis Stream + persist)
 │
 ├── infrastructure
 │   ├── chunker.{MarkdownChunker, PlainTextChunker}         text → List<Chunk>
 │   ├── embedding.BgeM3Client                               OkHttp → FastAPI 8002 (BGE-M3)
-│   └── vectorstore.qdrant.{QdrantClientConfig, QdrantHybridStore}  gRPC + dense/sparse + RRF
+│   ├── vectorstore.qdrant.{QdrantClientConfig, QdrantHybridStore}  gRPC + dense/sparse + RRF
+│   ├── persistence.mysql.{ConversationMapper, MessageMapper}       MyBatis (XML in resources/mapper)
+│   └── cache.redis.{RedisStreamConfig, RedisTokenStreamStore}      Redis Stream token buffer (resume)
 │
 └── interfaces.http
-    ├── QdrantController          /ai/qdrant/{init, upsert, query}    raw Qdrant ops (debug)
-    └── RagController             /ai/rag/{ask, stream, retrieve}     end-to-end RAG
+    ├── QdrantController          /ai/qdrant/{init, upsert, query, upload}   raw Qdrant ops (debug) + file ingest
+    ├── RagController             /ai/rag/{ask, stream, retrieve}            end-to-end RAG (stream = simple, non-resumable)
+    └── ChatStreamController      /ai/rag/messages, /ai/rag/messages/{id}/stream   resumable SSE (Last-Event-ID)
 ```
 
 ## Runtime layout
 
-Three external services must be running:
+External services. vLLM / BGE-M3 / Qdrant are required for RAG; MySQL + Redis are required for the resumable-SSE /
+persistence path (`ChatStreamController`):
 
 | Service        | Port        | Provides                                                                                                                                               |
 |----------------|-------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
 | vLLM (Qwen2.5) | 8000        | OpenAI-compatible chat — called via [VllmChatClient](src/main/java/com/luyublog/aidemo/infrastructure/llm/VllmChatClient.java) (OkHttp), not Spring AI |
 | BGE-M3 FastAPI | 8002        | `/encode` and `/encode_batch` returning `{dense[1024], sparse{tokenId:weight}}`                                                                        |
 | Qdrant         | 6334 (gRPC) | dense + sparse hybrid storage and Query API with RRF fusion                                                                                            |
+| MySQL          | 3306        | conversation/message persistence via MyBatis (schema in `resources/db/schema.sql`)                                                                     |
+| Redis          | 6379        | resumable-SSE token buffer (Redis Stream); generation survives client disconnect                                                                       |
 
 Query path:
 
@@ -151,11 +159,15 @@ to `RestClient` without verifying upsert still works.**
 `VllmChatClient` (no Spring AI in this path). System prompt + user prompt template are embedded in the service — change
 there, not in a config file. The system prompt tells the model to say "不知道" when retrieved context lacks the answer.
 
-The service exposes three entry points:
+The service exposes four entry points:
 
 - `ask(question, topK)` — sync: returns `RagAnswer(question, answer, sources)`
 - `askStream(question, topK)` — `Flux<String>` token stream (no `sources` because SSE has no place for structured
   fields; clients should call `retrieve` first)
+- `streamAnswer(question, docs)` — same as `askStream` but takes **pre-retrieved** docs, so callers can grab `sources`
+  first then trigger generation. Prompt assembly (SYSTEM_PROMPT + template) lives only here; `askStream` delegates to
+  it.
+  Used by `ChatStreamService` (resumable SSE) to persist sources separately from generation.
 - `retrieve(question, topK)` — embedding + Qdrant only, no LLM call (debugging / cite-only flows)
 
 ### Why VllmChatClient instead of Spring AI's OpenAiChatModel
@@ -171,7 +183,60 @@ built-in streaming — streaming is re-implemented with OkHttp `EventSource` (`o
 `spring-ai-commons` is kept as an explicit dep purely for `TokenTextSplitter` and `Document` in the chunker; that jar
 has no auto-config and no HTTP code, so the chat-side issue doesn't apply.
 
-## Ingest pipeline (currently unwired)
+## Resumable SSE (断点续传) — ChatStreamService + Redis Stream
+
+The plain `GET /ai/rag/stream` (RagController) is fire-and-forget: it returns a raw `Flux<String>` bound to the client
+connection, and `VllmChatClient.chatStream` does `sink.onDispose(source::cancel)` — **disconnect kills generation**. No
+event ids, nothing to resume from.
+
+The resumable path **decouples generation from delivery**, and the three layers stay strictly separated — the key being
+that **the neutral `StreamEvent` carries data across layers, so Redis/SSE SDK types never leak upward**:
+
+- **Two endpoints**
+  on [ChatStreamController](src/main/java/com/luyublog/aidemo/interfaces/http/ChatStreamController.java):
+  - `POST /ai/rag/messages` `{question, topK}` → creates `conversation` + a user `message` + an assistant `message`
+    (status `GENERATING`), kicks off background generation, returns `{conversationId, messageId}` immediately.
+  - `GET /ai/rag/messages/{id}/stream` → `SseEmitter`, reads `Last-Event-ID` header for resume.
+- **Generation runs on a background executor** (`chatGenerationExecutor` in `ChatGenerationConfig`), **not** on the SSE
+  subscription — this is what makes resume possible.
+  [ChatStreamService](src/main/java/com/luyublog/aidemo/application/chat/ChatStreamService.java)`.generate()` consumes
+  `ragService.streamAnswer(...)` via `toIterable()` (blocking on the bg thread), and for each token does
+  `RedisTokenStreamStore.append(messageId, token)` → `XADD rag:stream:{id} * c <token>`. On completion: `markDone`
+  (`XADD ... event=done` + `EXPIRE ttl`) and `MessageMapper.updateOutcome(DONE, fullText, sourcesJson, tokenCount)`. On
+  error: `markError` + status `FAILED`.
+- **Layer split for the read/tail path** — this was deliberately refactored so no SDK type crosses a boundary:
+  - **infrastructure
+    ** [RedisTokenStreamStore](src/main/java/com/luyublog/aidemo/infrastructure/cache/redis/RedisTokenStreamStore.java):
+    the *only* place that touches Redis SDK types. `subscribe(messageId, lastEventId, Consumer<StreamEvent>)` wires a
+    `StreamMessageListenerContainer` ([RedisStreamConfig](src/main/java/com/luyublog/aidemo/infrastructure/cache/redis/RedisStreamConfig.java))
+    — no consumer group, equivalent to `XREAD` from an offset — translates each `MapRecord` into a neutral
+    [StreamEvent](src/main/java/com/luyublog/aidemo/domain/conversation/StreamEvent.java) (`TOKEN`/`DONE`/`ERROR`, with
+    the entry id as `StreamEvent.id`), and returns the `Subscription` wrapped as a plain `AutoCloseable`. Field
+    decoding (`c` / `event=done|error`) lives here only. `lastEventId` blank → offset `"0"` (first connect, replay all);
+    non-blank → offset = that id (reconnect, replay only the gap), then tail.
+  - **application** `ChatStreamService.openStream(...)`: orchestration in neutral terms only. Decides Redis-tail vs
+    MySQL-fallback (`streamStore.exists`), stops the subscription on `DONE`/`ERROR` or when the sink throws, throws
+    `MessageNotFoundException` when neither Redis nor DB has it. Imports **no** Redis/SSE types.
+  - **interface** `ChatStreamController.emit(...)`: turns a `StreamEvent` into an `SseEmitter` frame
+    (`event().id().data()`, `name("done")`/`name("error")`), maps `MessageNotFoundException` → 404, and on every
+    terminal path (onCompletion/onTimeout/onError) closes the `AutoCloseable` so the subscription can't leak. A failed
+    `send` (client gone) is rethrown as `UncheckedIOException` so `ChatStreamService` stops the subscription at once.
+- **TTL fallback to MySQL.** If the client reconnects after the stream's TTL expired (`exists()` false), `openStream`
+  reads the persisted message and replays the full content as one `StreamEvent` (status `DONE`) — generation was never
+  lost because it was persisted on completion.
+
+Why this split: an earlier version did the subscribe + record-translation + lifecycle all inside the controller, which
+made `interfaces` import `MapRecord`/`Subscription`/`RedisTokenStreamStore` — violating "interfaces have no business
+logic" and "infrastructure is the only place that touches SDK types". Pushing translation down to infrastructure and
+orchestration into application, with `StreamEvent` (a `domain` type) as the lingua franca, restores the one-way
+dependency rule. `SseEmitter` stays in the controller because it *is* the outbound protocol.
+
+Why `SseEmitter` + `StreamMessageListenerContainer` instead of a reactive `Flux<ServerSentEvent>`: the container is
+push/callback-based and feeds the emitter naturally, and it handles both backlog replay and live tail from a single
+offset. `VllmChatClient` is **unchanged** — its one-shot stream is fine because the *background* subscriber, not the
+client, drives it.
+
+## Ingest pipeline
 
 [application/ingest/FileIngestService.java](src/main/java/com/luyublog/aidemo/application/ingest/FileIngestService.java)
 dispatches by suffix and returns `List<org.springframework.ai.document.Document>`:
@@ -198,13 +263,20 @@ derivations). Splitting them and retrieving one without the others gives the LLM
 mechanism in Qdrant to "fetch sibling chunks" — implementing parent-doc retrieval would be a big change. Better to keep
 bullets together unless they're clearly independent (`isWeaklyDependent`).
 
-**No controller currently calls `FileIngestService`** — the previous Neo4j upload endpoint was removed along with the
-Neo4j track. The fastest way to wire file upload → Qdrant is:
+**Wired via `POST /ai/qdrant/upload`**
+on [QdrantController](src/main/java/com/luyublog/aidemo/interfaces/http/QdrantController.java) (multipart form field
+name
+`file`). Per the layering rule, the controller holds **no business logic** — it just delegates to
+`FileIngestService.ingestAndStore(file)` and returns the `IngestResult`. The orchestration lives in the **application**
+layer (same pattern as `RagService`): `FileIngestService` injects `BgeM3Client` + `QdrantHybridStore` and does
+`ingest(file)` (chunk) → `embedBatch` over all chunk texts → build one `HybridPoint` per chunk (carrying
+`Document.getMetadata()` as payload) → `QdrantHybridStore.upsertBatch`. It returns
+[IngestResult](src/main/java/com/luyublog/aidemo/application/ingest/IngestResult.java) `(source, chunks, upserted)`.
 
-1. Add a `POST /ai/qdrant/upload`
-   to [QdrantController](src/main/java/com/luyublog/aidemo/interfaces/http/QdrantController.java)
-2. In that handler: `ingestService.ingest(file)` → for each `Document`, embed the text via `BgeM3Client.embedBatch`,
-   build `HybridPoint`, call `QdrantHybridStore.upsertBatch`
+`ingest(file)` stays a side-effect-free chunking step (reusable / debuggable); `ingestAndStore` composes it with embed +
+store. Type validation lives in `ingest` (415 for unsupported suffix, 400 for empty file); `ingestAndStore` guards
+against a chunk-count vs embedding-count mismatch. Collection must exist first (`POST /ai/qdrant/init` or
+`app.qdrant.initialize-schema=true`).
 
 ## Configuration knobs
 
@@ -218,4 +290,15 @@ Qdrant client, collection, and gRPC channel keepalive
 - `app.vllm.{base-url, api-key, model, temperature, timeout-seconds, pool.max-idle, pool.keep-alive-seconds}` — vLLM
   endpoint (api-key is a dummy; vLLM doesn't check). Switch `base-url` to real OpenAI / DeepSeek / etc. to use a hosted
   endpoint
-- `spring.servlet.multipart.max-file-size=20MB` — upload limit (legacy, kept for future ingestion endpoint)
+- `spring.datasource.{url, username, password, driver-class-name}` +
+  `mybatis.{mapper-locations, configuration.map-underscore-to-camel-case}` —
+  MySQL + MyBatis for conversation/message persistence
+- `spring.data.redis.{host, port, password, database}` — Redis (resumable-SSE token buffer)
+- `app.chat.stream.{key-prefix, ttl-seconds, emitter-timeout-ms}` — Redis Stream key prefix, post-completion TTL, and
+  SSE emitter timeout
+- `spring.servlet.multipart.max-file-size=20MB` — upload limit for `POST /ai/qdrant/upload`
+
+A secret-free template lives
+at [application-st.properties.example](src/main/resources/application-st.properties.example)
+(the real `application-st.properties` is gitignored). DDL is in
+[db/schema.sql](src/main/resources/db/schema.sql) — run it before first use (or wire `spring.sql.init`).

@@ -65,7 +65,15 @@ public class RagService {
      * 如需引用，可让前端先调 {@link #retrieve} 拿到 sources，再调本方法生成正文。
      */
     public Flux<String> askStream(String question, int topK) {
-        List<RetrievedDoc> docs = retrieve(question, topK);
+        return streamAnswer(question, retrieve(question, topK));
+    }
+
+    /**
+     * 用已检索好的 docs 渲染 prompt 并流式生成。把"检索"与"生成"拆开，方便上层
+     * （如可续传 SSE 的 {@code ChatStreamService}）先单独拿到 docs 落库 sources，再触发生成。
+     * prompt 拼接逻辑只此一处，避免在别处重复 SYSTEM_PROMPT。
+     */
+    public Flux<String> streamAnswer(String question, List<RetrievedDoc> docs) {
         String userPrompt = renderUserPrompt(question, renderContext(docs));
         return this.chatClient.chatStream(SYSTEM_PROMPT, userPrompt);
     }

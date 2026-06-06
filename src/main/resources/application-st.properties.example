@@ -1,0 +1,60 @@
+spring.application.name=aidemo
+server.port=8081
+
+# BGE-M3 编码服务（FastAPI）地址；batch-size 给 /encode_batch 用
+app.bgem3.base-url=http://localhost:8002
+app.bgem3.batch-size=12
+app.bgem3.pool.max-idle=20
+app.bgem3.pool.keep-alive-seconds=300
+app.bgem3.timeout-seconds=30
+
+# vLLM (OpenAI 兼容) 或真实 OpenAI 的 chat 端点。
+app.vllm.base-url=http://localhost:8000
+app.vllm.api-key=dummy
+app.vllm.model=Qwen/Qwen2.5-7B-Instruct-AWQ
+app.vllm.temperature=0.3
+app.vllm.timeout-seconds=120
+app.vllm.pool.max-idle=10
+app.vllm.pool.keep-alive-seconds=300
+
+# Qdrant gRPC 端点（注意是 6334，不是 dashboard 的 6333）
+app.qdrant.host=YOUR_QDRANT_HOST
+app.qdrant.grpc-port=6334
+app.qdrant.use-tls=false
+app.qdrant.api-key=YOUR_QDRANT_API_KEY
+app.qdrant.collection=rag_docs
+app.qdrant.dense-name=dense
+app.qdrant.sparse-name=sparse
+app.qdrant.dense-dim=1024
+app.qdrant.hnsw-m=16
+app.qdrant.initialize-schema=true
+app.qdrant.call-timeout-seconds=30
+app.qdrant.keepalive-seconds=30
+app.qdrant.keepalive-timeout-seconds=10
+app.qdrant.idle-timeout-seconds=300
+
+# MySQL + MyBatis：对话/消息持久化
+spring.datasource.url=jdbc:mysql://localhost:3306/aidemo?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+spring.datasource.username=root
+spring.datasource.password=YOUR_DB_PASSWORD
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+mybatis.mapper-locations=classpath:mapper/*.xml
+mybatis.configuration.map-underscore-to-camel-case=true
+
+# Redis：可续传 SSE 的 token 缓冲(Redis Stream)
+spring.data.redis.host=localhost
+spring.data.redis.port=6379
+#spring.data.redis.password=YOUR_REDIS_PASSWORD
+spring.data.redis.database=0
+
+# 可续传 SSE 流缓冲
+app.chat.stream.key-prefix=rag:stream:
+app.chat.stream.ttl-seconds=3600
+app.chat.stream.emitter-timeout-ms=300000
+
+spring.servlet.multipart.enabled=true
+spring.servlet.multipart.max-file-size=20MB
+spring.servlet.multipart.max-request-size=20MB
+
+logging.level.org.springframework.ai=info
+logging.level.com.luyublog.aidemo=debug

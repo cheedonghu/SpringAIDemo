@@ -1,8 +1,12 @@
 package com.luyublog.aidemo.application.ingest;
 
 import com.luyublog.aidemo.domain.document.Chunk;
+import com.luyublog.aidemo.domain.embedding.EmbedResult;
+import com.luyublog.aidemo.domain.retrieval.HybridPoint;
 import com.luyublog.aidemo.infrastructure.chunker.MarkdownChunker;
 import com.luyublog.aidemo.infrastructure.chunker.PlainTextChunker;
+import com.luyublog.aidemo.infrastructure.embedding.BgeM3Client;
+import com.luyublog.aidemo.infrastructure.vectorstore.qdrant.QdrantHybridStore;
 import org.springframework.ai.document.Document;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -15,15 +19,57 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.*;
 
+/**
+ * 文件灌库用例编排：上传文件 → 按后缀分块 → BGE-M3 批量编码 → Qdrant 批量 upsert。
+ *
+ * <p>编排（{@link #ingestAndStore}）放在 application 层，与 {@code RagService} 同样的范式：
+ * 注入 infra 客户端，对外只暴露 application/domain 类型。controller 不做业务逻辑。
+ * 纯分块步骤（{@link #ingest}）保持无副作用，便于调试与复用。
+ */
 @Service
 public class FileIngestService {
 
     private final MarkdownChunker markdownChunker;
     private final PlainTextChunker plainTextChunker;
+    private final BgeM3Client bgeM3Client;
+    private final QdrantHybridStore qdrantStore;
 
-    public FileIngestService(MarkdownChunker markdownChunker, PlainTextChunker plainTextChunker) {
+    public FileIngestService(MarkdownChunker markdownChunker,
+                             PlainTextChunker plainTextChunker,
+                             BgeM3Client bgeM3Client,
+                             QdrantHybridStore qdrantStore) {
         this.markdownChunker = markdownChunker;
         this.plainTextChunker = plainTextChunker;
+        this.bgeM3Client = bgeM3Client;
+        this.qdrantStore = qdrantStore;
+    }
+
+    /**
+     * 完整灌库链路：分块 → 编码 → 写 Qdrant。controller 直接调本方法即可。
+     */
+    public IngestResult ingestAndStore(MultipartFile file) {
+        List<Document> documents = ingest(file);
+        String source = StringUtils.hasText(file.getOriginalFilename()) ? file.getOriginalFilename() : "unnamed";
+        if (documents.isEmpty()) {
+            return new IngestResult(source, 0, 0);
+        }
+
+        List<String> texts = new ArrayList<>(documents.size());
+        for (Document doc : documents) {
+            texts.add(doc.getText());
+        }
+        List<EmbedResult> embeddings = this.bgeM3Client.embedBatch(texts);
+        if (embeddings.size() != texts.size()) {
+            throw new IllegalStateException(
+                    "bge-m3 returned " + embeddings.size() + " embeddings for " + texts.size() + " chunks");
+        }
+
+        List<HybridPoint> points = new ArrayList<>(documents.size());
+        for (int i = 0; i < documents.size(); i++) {
+            points.add(new HybridPoint(texts.get(i), documents.get(i).getMetadata(), embeddings.get(i)));
+        }
+        int upserted = this.qdrantStore.upsertBatch(points);
+        return new IngestResult(source, documents.size(), upserted);
     }
 
     public List<Document> ingest(MultipartFile file) {

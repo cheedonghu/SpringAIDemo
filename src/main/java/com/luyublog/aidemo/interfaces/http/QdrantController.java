@@ -1,11 +1,14 @@
 package com.luyublog.aidemo.interfaces.http;
 
+import com.luyublog.aidemo.application.ingest.FileIngestService;
+import com.luyublog.aidemo.application.ingest.IngestResult;
 import com.luyublog.aidemo.domain.embedding.EmbedResult;
 import com.luyublog.aidemo.domain.retrieval.HybridPoint;
 import com.luyublog.aidemo.domain.retrieval.RetrievedDoc;
 import com.luyublog.aidemo.infrastructure.embedding.BgeM3Client;
 import com.luyublog.aidemo.infrastructure.vectorstore.qdrant.QdrantHybridStore;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -18,6 +21,7 @@ import java.util.Map;
  * <ul>
  *   <li>{@code POST /ai/qdrant/init}：手动触发 ensureCollection（也可关掉自动 initialize-schema 后用这个）</li>
  *   <li>{@code POST /ai/qdrant/upsert}：传 List&lt;String&gt; 文本，自动 BGE-M3 编码后批量 upsert</li>
+ *   <li>{@code POST /ai/qdrant/upload}：上传 .md/.txt 文件，分块 → BGE-M3 编码 → 批量 upsert</li>
  *   <li>{@code GET  /ai/qdrant/query?text=...&topK=5}：编码后跑 dense+sparse RRF 混检</li>
  * </ul>
  */
@@ -26,10 +30,12 @@ public class QdrantController {
 
     private final BgeM3Client bgeM3Client;
     private final QdrantHybridStore qdrantStore;
+    private final FileIngestService ingestService;
 
-    public QdrantController(BgeM3Client bgeM3Client, QdrantHybridStore qdrantStore) {
+    public QdrantController(BgeM3Client bgeM3Client, QdrantHybridStore qdrantStore, FileIngestService ingestService) {
         this.bgeM3Client = bgeM3Client;
         this.qdrantStore = qdrantStore;
+        this.ingestService = ingestService;
     }
 
     @PostMapping("/ai/qdrant/init")
@@ -54,6 +60,16 @@ public class QdrantController {
         }
         int count = this.qdrantStore.upsertBatch(points);
         return Map.of("upserted", count, "source", source);
+    }
+
+    /**
+     * 上传 .md / .txt 文件灌库。multipart 表单字段名为 {@code file}。
+     * 分块 → 编码 → upsert 的编排都在 {@link FileIngestService#ingestAndStore} 里；
+     * 不支持的后缀抛 415、空文件抛 400，均由 application 层负责。
+     */
+    @PostMapping("/ai/qdrant/upload")
+    public IngestResult upload(@RequestParam("file") MultipartFile file) {
+        return this.ingestService.ingestAndStore(file);
     }
 
     @GetMapping("/ai/qdrant/query")

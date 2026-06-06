@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.luyublog.aidemo.infrastructure.persistence.mysql.ConversationMapper">
+
+    <insert id="insert" parameterType="com.luyublog.aidemo.domain.conversation.Conversation">
+        INSERT INTO conversation (id, title, created_at, updated_at)
+        VALUES (#{id}, #{title}, #{createdAt}, #{updatedAt})
+    </insert>
+
+</mapper>
