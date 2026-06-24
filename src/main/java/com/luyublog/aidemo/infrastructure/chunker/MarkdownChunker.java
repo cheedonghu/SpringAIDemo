@@ -46,6 +46,13 @@ public class MarkdownChunker {
      * 整组 bullets 总长低于此阈值 → 直接 section-level（不值得拆）。
      */
     private static final int SECTION_LEVEL_TOTAL_THRESHOLD = 400;
+    /**
+     * prose section 超过 {@link #PROSE_MAX_TOKENS} token 时,按句子贪心打包到
+     * {@code [PROSE_TARGET_TOKENS, PROSE_MAX_TOKENS]} 区间兜底,避免单个超大 chunk
+     * 稀释 dense 向量、撑爆 LLM 上下文。
+     */
+    private static final int PROSE_TARGET_TOKENS = 400;
+    private static final int PROSE_MAX_TOKENS = 500;
 
     public List<Chunk> chunk(String content) {
         if (!StringUtils.hasText(content)) {
@@ -128,10 +135,20 @@ public class MarkdownChunker {
         } else if (!proseBuffer.isEmpty()) {
             String prose = String.join("\n", proseBuffer).trim();
             if (StringUtils.hasText(prose)) {
-                String text = composeText(parentHeadings, currentHeading, prose);
-                chunks.add(new Chunk(text, buildMetadata(
-                        currentHeading, parentHeadings, headingLevel,
-                        "prose", "section", -1, text)));
+                if (estimateTokens(prose) <= PROSE_MAX_TOKENS) {
+                    String text = composeText(parentHeadings, currentHeading, prose);
+                    chunks.add(new Chunk(text, buildMetadata(
+                            currentHeading, parentHeadings, headingLevel,
+                            "prose", "section", -1, text)));
+                } else {
+                    // 超长 prose section：按句子贪心打包兜底，每片仍带标题前缀
+                    for (String piece : SentencePacker.packBySentence(prose, PROSE_TARGET_TOKENS, PROSE_MAX_TOKENS)) {
+                        String text = composeText(parentHeadings, currentHeading, piece);
+                        chunks.add(new Chunk(text, buildMetadata(
+                                currentHeading, parentHeadings, headingLevel,
+                                "prose", "paragraph", -1, text)));
+                    }
+                }
             }
         }
 

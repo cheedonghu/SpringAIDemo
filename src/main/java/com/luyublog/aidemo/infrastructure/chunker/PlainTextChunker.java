@@ -33,10 +33,6 @@ public class PlainTextChunker {
      * 段落分隔：一个或多个空行
      */
     private static final Pattern PARAGRAPH_SPLIT = Pattern.compile("\\R\\s*\\R+");
-    /**
-     * 中英文句末符号，作为段内二次切分的优先切点
-     */
-    private static final Pattern SENTENCE_BOUNDARY = Pattern.compile("(?<=[。！？!?\\.])\\s*");
 
     private static final int TARGET_TOKENS = 400;
     private static final int MAX_TOKENS = 500;
@@ -61,7 +57,7 @@ public class PlainTextChunker {
                 appendOrMerge(chunkTexts, paragraph);
             } else {
                 // 段太长：按句子切，再贪心合并到目标区间
-                for (String chunk : splitParagraphBySentence(paragraph)) {
+                for (String chunk : SentencePacker.packBySentence(paragraph, TARGET_TOKENS, MAX_TOKENS)) {
                     appendOrMerge(chunkTexts, chunk);
                 }
             }
@@ -100,41 +96,4 @@ public class PlainTextChunker {
         }
     }
 
-    /**
-     * 段内按句子切分，再贪心合并：尽量让每个子段在 [TARGET, MAX] token 区间。
-     * 单句超过 MAX 时不再强切（语义优先），整句作为一个 chunk。
-     */
-    private List<String> splitParagraphBySentence(String paragraph) {
-        String[] sentences = SENTENCE_BOUNDARY.split(paragraph);
-        List<String> result = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        int currentTokens = 0;
-
-        for (String sentence : sentences) {
-            String s = sentence.strip();
-            if (s.isEmpty()) {
-                continue;
-            }
-            int sTokens = MarkdownChunker.estimateTokens(s);
-            if (currentTokens + sTokens > MAX_TOKENS && currentTokens > 0) {
-                result.add(current.toString().strip());
-                current.setLength(0);
-                currentTokens = 0;
-            }
-            if (current.length() > 0) {
-                current.append(' ');
-            }
-            current.append(s);
-            currentTokens += sTokens;
-            if (currentTokens >= TARGET_TOKENS) {
-                result.add(current.toString().strip());
-                current.setLength(0);
-                currentTokens = 0;
-            }
-        }
-        if (current.length() > 0) {
-            result.add(current.toString().strip());
-        }
-        return result;
-    }
 }

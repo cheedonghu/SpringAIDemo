@@ -48,8 +48,8 @@ public class ChatStreamController {
         return this.chatStreamService.start(request.question(), topK);
     }
 
-    @GetMapping(value = "/ai/rag/messages/{id}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter stream(@PathVariable("id") String messageId,
+    @GetMapping(value = "/ai/rag/messages/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter stream(@RequestParam("id") String messageId,
                              @RequestHeader(value = "Last-Event-ID", required = false) String lastEventId) {
         SseEmitter emitter = new SseEmitter(this.emitterTimeoutMs > 0 ? this.emitterTimeoutMs : Long.MAX_VALUE);
 

@@ -18,6 +18,15 @@ Spring Boot 3.5 + Java 17 + Spring AI 1.1.7 (stable). Dependencies resolve from 
 ./mvnw test -Dtest=ClassName#methodName
 ```
 
+Tests live in `src/test`: chunker unit tests (`MarkdownChunkerTest`, `PlainTextChunkerTest`) run offline.
+`BgeM3ClientLiveTest` is a smoke test against the real FastAPI on :8002 and is **disabled by default**
+(`@EnabledIfSystemProperty(bgem3.live=true)`), so a plain `mvn test` / CI run skips it. To run it explicitly:
+
+```bash
+./mvnw test -Dtest=BgeM3ClientLiveTest -Dbgem3.live=true
+# override target: -Dbgem3.base-url=http://other-host:8002
+```
+
 Active profile is `st` (see `spring.profiles.active=st`
 in [application.properties](src/main/resources/application.properties)). All non-trivial config lives
 in [application-st.properties](src/main/resources/application-st.properties) — that file is gitignored on purpose
@@ -247,12 +256,20 @@ dispatches by suffix and returns `List<org.springframework.ai.document.Document>
   whole bullet group becomes one chunk — and falls back to per-bullet chunks only when `isWeaklyDependent(...)` returns
   true (group total ≥ 400 chars AND no strong-order markers like "第N步", "首先/然后/最后", `\d+[.、)]`). chunk text is *
   *prefixed** by `"parentHeadings - heading：内容"`. Short bullets (< 8 chars) in bullet-level mode merge via `；`. Code
-  fences `` ``` `` are passed through as prose.
+  fences `` ``` `` are passed through as prose. **Prose (non-bullet) sections have a size cap**: a section's prose
+  becomes one `section` chunk only while ≤ 500 tokens; beyond that it falls back to sentence-greedy packing
+  (granularity `paragraph`, each piece still carrying the heading prefix) so a single heading-less wall of text can't
+  produce one oversized chunk that dilutes the dense vector. The packing reuses the shared `SentencePacker`.
 - `.txt` → [PlainTextChunker](src/main/java/com/luyublog/aidemo/infrastructure/chunker/PlainTextChunker.java):
   paragraph-aware. Splits by blank lines (`\n\n+`); paragraphs ≤ 500 tokens become single chunks; longer paragraphs
-  split by Chinese/English sentence boundaries (`。！？/.!?`) and greedily pack to 300~500 tokens. Tiny consecutive
+  split by Chinese/English sentence boundaries (`。！？/.!?`) and greedily pack to 400~500 tokens. Tiny consecutive
   paragraphs merge into the previous chunk (avoids noise). **No Spring AI `TokenTextSplitter` anymore** — it sliced
   mid-Chinese-sentence.
+- [SentencePacker](src/main/java/com/luyublog/aidemo/infrastructure/chunker/SentencePacker.java): shared sentence-greedy
+  packer (`packBySentence(text, target, max)`) used by both chunkers — `PlainTextChunker` for over-long paragraphs,
+  `MarkdownChunker` for over-long prose sections. Splits on `。！？/.!?`, packs to `[target, max]`, never hard-cuts a
+  single over-`max` sentence. **No overlap by design** — splits land on semantic (sentence) boundaries, so the usual
+  fixed-window overlap band-aid isn't needed.
 - Both chunkers attach metadata: `chunkType` (`bullet`/`section`/`prose`/`code`), `granularity` (`bullet`/`section`/
   `paragraph`), `tokenCount` (rough estimate via `MarkdownChunker.estimateTokens`: `汉字 * 1.4 + 英文字符 * 0.3`),
   `headingLevel` (md only). The shared [Chunk](src/main/java/com/luyublog/aidemo/domain/document/Chunk.java) record
