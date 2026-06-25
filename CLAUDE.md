@@ -69,13 +69,13 @@ com.luyublog.aidemo
 ├── application
 │   ├── ingest.{FileIngestService, IngestResult}            upload → chunk → embed → upsert  (wired via POST /ai/qdrant/upload)
 │   ├── rag.{RagService, RagAnswer}                         embed query → retrieve → prompt → LLM
-│   └── chat.{ChatStreamService, ChatGenerationConfig, MessageNotFoundException}  resumable SSE orchestration (bg generate → Redis Stream + persist)
+│   └── chat.{ChatStreamService, ChatGenerationConfig, MessageNotFoundException, StuckGenerationReaper}  resumable SSE orchestration + crash-recovery watchdog
 │
 ├── infrastructure
 │   ├── chunker.{MarkdownChunker, PlainTextChunker}         text → List<Chunk>
 │   ├── embedding.BgeM3Client                               OkHttp → FastAPI 8002 (BGE-M3)
 │   ├── vectorstore.qdrant.{QdrantClientConfig, QdrantHybridStore}  gRPC + dense/sparse + RRF
-│   ├── persistence.mysql.{ConversationMapper, MessageMapper}       MyBatis (XML in resources/mapper)
+│   ├── persistence.mysql.{ConversationMapper, MessageMapper, WatchdogMapper}  MyBatis (XML in resources/mapper)
 │   └── cache.redis.{RedisStreamConfig, RedisTokenStreamStore}      Redis Stream token buffer (resume)
 │
 └── interfaces.http
@@ -210,9 +210,24 @@ that **the neutral `StreamEvent` carries data across layers, so Redis/SSE SDK ty
   subscription — this is what makes resume possible.
   [ChatStreamService](src/main/java/com/luyublog/aidemo/application/chat/ChatStreamService.java)`.generate()` consumes
   `ragService.streamAnswer(...)` via `toIterable()` (blocking on the bg thread), and for each token does
-  `RedisTokenStreamStore.append(messageId, token)` → `XADD rag:stream:{id} * c <token>`. On completion: `markDone`
-  (`XADD ... event=done` + `EXPIRE ttl`) and `MessageMapper.updateOutcome(DONE, fullText, sourcesJson, tokenCount)`. On
-  error: `markError` + status `FAILED`.
+  `RedisTokenStreamStore.append(messageId, token)` → **`XADD rag:stream:{id} * c <token>` + `EXPIRE` run as one atomic
+  Lua script (sliding TTL)**. On completion: `markDone` (`XADD ... event=done` + `EXPIRE`) and
+  `MessageMapper.updateOutcome(DONE, fullText, sourcesJson, tokenCount)`. On error: `markError` + status `FAILED`.
+  `markDone`/`markError` go through the **same** `XADD_EXPIRE` script.
+  **Dual TTL** — `append` sets `inflight-ttl-seconds` (≥ vLLM readTimeout, default 150), `markDone`/`markError` set
+  `resume-ttl-seconds` (post-completion resume window, default 60). One TTL can't serve both: the in-flight TTL doubles
+  as a **liveness signal** (see watchdog below) so it must exceed the max inter-token gap, while the resume window can
+  be
+  short.
+  **Why sliding TTL, not just on terminal markDone/markError**: a hard process kill (`kill -9` / OOM / redeploy) never
+  reaches those code paths, so a TTL set only there would leave the in-flight key immortal (Redis leak, one per crash).
+  Refreshing the TTL on each `append` makes the key always carry an expiry that **Redis** enforces regardless of app
+  liveness — it self-collects `inflight-ttl` seconds after the last token. (Setting TTL only at creation is unsafe too:
+  a generation longer than the TTL would expire mid-stream, then the next `XADD` recreates the key with no TTL again.)
+  **Why a Lua script, not two calls**: a plain `XADD` then `EXPIRE` is two commands — if the process dies *between* them
+  (or the `EXPIRE` round-trip fails), the entry exists with no TTL → immortal key again. Lua executes both atomically
+  server-side, so "XADD succeeded, EXPIRE missing" is never an observable/persisted state. `markDone`/`markError` share
+  the race, hence they use the same script.
 - **Layer split for the read/tail path** — this was deliberately refactored so no SDK type crosses a boundary:
   - **infrastructure
     ** [RedisTokenStreamStore](src/main/java/com/luyublog/aidemo/infrastructure/cache/redis/RedisTokenStreamStore.java):
@@ -226,10 +241,20 @@ that **the neutral `StreamEvent` carries data across layers, so Redis/SSE SDK ty
   - **application** `ChatStreamService.openStream(...)`: orchestration in neutral terms only. Decides Redis-tail vs
     MySQL-fallback (`streamStore.exists`), stops the subscription on `DONE`/`ERROR` or when the sink throws, throws
     `MessageNotFoundException` when neither Redis nor DB has it. Imports **no** Redis/SSE types.
-  - **interface** `ChatStreamController.emit(...)`: turns a `StreamEvent` into an `SseEmitter` frame
-    (`event().id().data()`, `name("done")`/`name("error")`), maps `MessageNotFoundException` → 404, and on every
-    terminal path (onCompletion/onTimeout/onError) closes the `AutoCloseable` so the subscription can't leak. A failed
-    `send` (client gone) is rethrown as `UncheckedIOException` so `ChatStreamService` stops the subscription at once.
+  - **interface** `ChatStreamController.emit(...)`: turns a `StreamEvent` into an `SseEmitter` frame — each token =
+    `data: {"content":"今天","finish_reason":null}` (slim chunk, just those two fields), success ends with a
+    `{"content":"","finish_reason":"stop"}` chunk then `data: [DONE]`, failure ends with `data: [ERROR]` (client treats
+    both sentinels as end-of-stream). The SSE `id:` field is **kept** (token + terminal) for `Last-Event-ID` resume —
+    `id:` alongside `data:` is valid SSE and OpenAI-style parsers ignore it.
+    Maps `MessageNotFoundException` → 404, and on every terminal path (onCompletion/onTimeout/onError) closes the
+    `AutoCloseable` so the subscription can't leak. A failed `send` (client gone) is rethrown as `UncheckedIOException`
+    so `ChatStreamService` stops the subscription at once.
+    **Client contract**: on `[DONE]` the client must `EventSource.close()` (else it auto-reconnects). On `[ERROR]` it
+    may reconnect — the browser keeps `lastEventId` at the last *token* (an event with no `id:` doesn't reset it), so
+    the
+    auto-reconnect resumes from the right offset; a transient emitter-timeout then continues to `[DONE]`. But `[ERROR]`
+    is intentionally detail-free, so a **genuine** FAILED (watchdog / dead vLLM) just replays `[ERROR]` → the client
+    **must bound retries** (a few backoff attempts) then stop and offer *regenerate* instead of looping forever.
 - **TTL fallback to MySQL.** If the client reconnects after the stream's TTL expired (`exists()` false), `openStream`
   reads the persisted message and replays the full content as one `StreamEvent` (status `DONE`) — generation was never
   lost because it was persisted on completion.
@@ -244,6 +269,36 @@ Why `SseEmitter` + `StreamMessageListenerContainer` instead of a reactive `Flux<
 push/callback-based and feeds the emitter naturally, and it handles both backlog replay and live tail from a single
 offset. `VllmChatClient` is **unchanged** — its one-shot stream is fine because the *background* subscriber, not the
 client, drives it.
+
+### Crash recovery — watchdog (生产者崩溃 → 消费者卡死)
+
+If the producer JVM is **hard-killed** mid-generation (`kill -9` / OOM / instance down), neither `markDone` nor
+`markError` runs, so the stream gets a last token but **no terminal marker**. A consumer tailing it would never receive
+`DONE`/`ERROR` → the SSE hangs until the emitter timeout, with no terminal event; the `message` row stays `GENERATING`
+forever. Multi-instance makes it worse: a consumer on instance B tails a stream whose producer instance A died.
+
+Two mechanisms cover this:
+
+- **Watchdog table + reaper** (eventual cleanup, multi-instance-safe). `ChatStreamService.start()` inserts a
+  [`watchdog`](src/main/resources/db/schema.sql) row alongside the assistant message; `generate()` deletes it in a
+  `finally`. So the table holds only in-flight generations (and self-heals: a row left by a crash is reconciled by the
+  scan). [StuckGenerationReaper](src/main/java/com/luyublog/aidemo/application/chat/StuckGenerationReaper.java)
+  (`@Scheduled`, needs `@EnableScheduling`) scans `watchdog` rows older than `watchdog-grace-seconds`; for each, if
+  `streamStore.exists(id)` is **false** (the in-flight stream key expired → producer stopped refreshing → dead), it
+  finalizes via `MessageMapper.finalizeIfGenerating(FAILED)` (conditional `WHERE status='GENERATING'` → multi-instance
+  only one wins, and won't clobber a just-completed `DONE`) and deletes the watchdog row. Liveness signal = the stream
+  key's existence (kept alive by the sliding `inflight-ttl`); the **grace period** avoids killing a freshly-started
+  generation that hasn't written its first token yet (the stream key is created lazily on the first `XADD`).
+- **Emitter-timeout terminal event** (prompt, for the *live* consumer). The reaper is bounded by `inflight-ttl`
+  (~150s) so it's too slow to unblock a client that's actively tailing; instead `ChatStreamController.onTimeout` sends a
+  terminal `error` SSE event then completes, so the client gets a clear signal instead of a silent close. (Resumable
+  reconnect makes a short `emitter-timeout-ms` safe.)
+
+Known trade-off: detection latency ≈ `inflight-ttl`, which is coupled to the resume window's sibling TTL only loosely
+(they're separate knobs) but bounded below by the vLLM readTimeout — going to ~30s detection would require a dedicated
+short-TTL **heartbeat key** refreshed by the producer (decouples liveness from stream activity), which we deliberately
+did **not** add. The model side (vLLM) is not resumable: a dropped vLLM call is dead, so the watchdog marks it `FAILED`
+and the UI is expected to offer **regenerate** (re-issue from the persisted question) rather than resume.
 
 ## Ingest pipeline
 
@@ -311,8 +366,10 @@ Qdrant client, collection, and gRPC channel keepalive
   `mybatis.{mapper-locations, configuration.map-underscore-to-camel-case}` —
   MySQL + MyBatis for conversation/message persistence
 - `spring.data.redis.{host, port, password, database}` — Redis (resumable-SSE token buffer)
-- `app.chat.stream.{key-prefix, ttl-seconds, emitter-timeout-ms}` — Redis Stream key prefix, post-completion TTL, and
-  SSE emitter timeout
+-
+`app.chat.stream.{key-prefix, inflight-ttl-seconds, resume-ttl-seconds, emitter-timeout-ms, watchdog-scan-ms, watchdog-grace-seconds}`
+— Redis Stream key prefix; in-flight sliding TTL (liveness, ≥ vLLM readTimeout) vs post-completion resume-window TTL;
+SSE emitter timeout; watchdog scan interval and grace period
 - `spring.servlet.multipart.max-file-size=20MB` — upload limit for `POST /ai/qdrant/upload`
 
 A secret-free template lives

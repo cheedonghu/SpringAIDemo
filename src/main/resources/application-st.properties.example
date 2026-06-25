@@ -49,8 +49,14 @@ spring.data.redis.database=0
 
 # 可续传 SSE 流缓冲
 app.chat.stream.key-prefix=rag:stream:
-app.chat.stream.ttl-seconds=3600
+# 生成进行中每 token 续期 TTL(秒):判活 + 防永生 key,须 >= vLLM readTimeout
+app.chat.stream.inflight-ttl-seconds=150
+# 生成完成后的续传窗口 TTL(秒)
+app.chat.stream.resume-ttl-seconds=60
 app.chat.stream.emitter-timeout-ms=300000
+# 看门狗巡检:扫描周期(毫秒)+ 宽限期(秒)
+app.chat.stream.watchdog-scan-ms=15000
+app.chat.stream.watchdog-grace-seconds=60
 
 spring.servlet.multipart.enabled=true
 spring.servlet.multipart.max-file-size=20MB

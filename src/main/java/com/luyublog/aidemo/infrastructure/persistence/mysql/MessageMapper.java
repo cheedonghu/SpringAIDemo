@@ -23,5 +23,13 @@ public interface MessageMapper {
                       @Param("tokenCount") Integer tokenCount,
                       @Param("updatedAt") LocalDateTime updatedAt);
 
+    /**
+     * 看门狗收尾用：仅当消息仍处 {@code GENERATING} 时才改状态。{@code WHERE ... AND status='GENERATING'}
+     * 保证多节点并发只一个成功，且不会误改已正常完成(DONE)的消息。返回受影响行数(0 或 1)。
+     */
+    int finalizeIfGenerating(@Param("id") String id,
+                             @Param("status") MessageStatus status,
+                             @Param("updatedAt") LocalDateTime updatedAt);
+
     Message findById(@Param("id") String id);
 }

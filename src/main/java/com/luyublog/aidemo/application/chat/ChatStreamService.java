@@ -10,6 +10,7 @@ import com.luyublog.aidemo.domain.retrieval.RetrievedDoc;
 import com.luyublog.aidemo.infrastructure.cache.redis.RedisTokenStreamStore;
 import com.luyublog.aidemo.infrastructure.persistence.mysql.ConversationMapper;
 import com.luyublog.aidemo.infrastructure.persistence.mysql.MessageMapper;
+import com.luyublog.aidemo.infrastructure.persistence.mysql.WatchdogMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -41,6 +42,7 @@ public class ChatStreamService {
     private final RedisTokenStreamStore streamStore;
     private final MessageMapper messageMapper;
     private final ConversationMapper conversationMapper;
+    private final WatchdogMapper watchdogMapper;
     private final Executor executor;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -48,11 +50,13 @@ public class ChatStreamService {
                              RedisTokenStreamStore streamStore,
                              MessageMapper messageMapper,
                              ConversationMapper conversationMapper,
+                             WatchdogMapper watchdogMapper,
                              @Qualifier("chatGenerationExecutor") Executor executor) {
         this.ragService = ragService;
         this.streamStore = streamStore;
         this.messageMapper = messageMapper;
         this.conversationMapper = conversationMapper;
+        this.watchdogMapper = watchdogMapper;
         this.executor = executor;
     }
 
@@ -71,6 +75,8 @@ public class ChatStreamService {
                 userMessageId, conversationId, "user", question, MessageStatus.DONE, null, null, now, now));
         this.messageMapper.insert(new Message(
                 assistantMessageId, conversationId, "assistant", "", MessageStatus.GENERATING, null, null, now, now));
+        // 登记看门狗:生成中途崩溃(进程被杀,跑不到 finally)时,由 StuckGenerationReaper 据此收尾
+        this.watchdogMapper.insert(assistantMessageId, conversationId, now);
 
         this.executor.execute(() -> generate(assistantMessageId, question, topK));
         return new StartResult(conversationId, assistantMessageId);
@@ -103,6 +109,13 @@ public class ChatStreamService {
             this.streamStore.markError(messageId);
             this.messageMapper.updateOutcome(
                     messageId, MessageStatus.FAILED, full.toString(), sourcesJson, tokenCount, LocalDateTime.now());
+        } finally {
+            // 正常结束(done/error)即注销看门狗;若进程在此之前被硬杀,残留行交给巡检兜底
+            try {
+                this.watchdogMapper.delete(messageId);
+            } catch (Exception ex) {
+                log.warn("[chat] watchdog delete failed messageId={}: {}", messageId, ex.getMessage());
+            }
         }
     }
 

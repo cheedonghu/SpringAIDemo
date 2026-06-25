@@ -35,6 +35,14 @@
         WHERE id = #{id}
     </update>
 
+    <update id="finalizeIfGenerating">
+        UPDATE message
+        SET status = #{status},
+        updated_at = #{updatedAt}
+        WHERE id = #{id}
+        AND status = 'GENERATING'
+    </update>
+
     <select id="findById" resultMap="messageResult">
         SELECT id,
         conversation_id,
